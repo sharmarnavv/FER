@@ -13,16 +13,17 @@ import torch.nn as nn
 import torch.utils.data as data
 from torchvision import transforms, datasets
 
-from networks.dan import DAN
-
+from networks.dan import DAN, CenterLoss, PartitionLoss
 
 eps = sys.float_info.epsilon
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--aff_path', type=str, default='datasets/AfectNet/', help='AfectNet dataset path.')
-    parser.add_argument('--batch_size', type=int, default=256, help='Batch size.')
-    parser.add_argument('--lr', type=float, default=0.0001, help='Initial learning rate for adam.')
+    parser.add_argument('--batch_size', type=int, default=128, help='Batch size.')
+    parser.add_argument('--lr_backbone', type=float, default=1e-4, help='Learning rate for backbone.')
+    parser.add_argument('--lr_head', type=float, default=1e-3, help='Learning rate for head.')
+    parser.add_argument('--lr_center', type=float, default=0.5, help='Learning rate for center loss.')
     parser.add_argument('--workers', default=8, type=int, help='Number of data loading workers.')
     parser.add_argument('--epochs', type=int, default=40, help='Total training epochs.')
     parser.add_argument('--num_head', type=int, default=4, help='Number of attention head.')
@@ -53,7 +54,6 @@ class AffectNet(data.Dataset):
         self.label = self.data.loc[:, 'label'].values
 
         _, self.sample_counts = np.unique(self.label, return_counts=True)
-        # print(f' distribution of {phase} samples: {self.sample_counts}')
 
     def get_df(self):
         train_path = os.path.join(self.aff_path,'train_set/')
@@ -87,51 +87,6 @@ class AffectNet(data.Dataset):
         
         return image, label
 
-class AffinityLoss(nn.Module):
-    def __init__(self, device, num_class=8, feat_dim=512):
-        super(AffinityLoss, self).__init__()
-        self.num_class = num_class
-        self.feat_dim = feat_dim
-        self.gap = nn.AdaptiveAvgPool2d(1)
-        self.device = device
-
-        self.centers = nn.Parameter(torch.randn(self.num_class, self.feat_dim).to(device))
-
-    def forward(self, x, labels):
-        x = self.gap(x).view(x.size(0), -1)
-
-        batch_size = x.size(0)
-        distmat = torch.pow(x, 2).sum(dim=1, keepdim=True).expand(batch_size, self.num_class) + \
-                  torch.pow(self.centers, 2).sum(dim=1, keepdim=True).expand(self.num_class, batch_size).t()
-        distmat.addmm_(x, self.centers.t(), beta=1, alpha=-2)
-
-        classes = torch.arange(self.num_class).long().to(self.device)
-        labels = labels.unsqueeze(1).expand(batch_size, self.num_class)
-        mask = labels.eq(classes.expand(batch_size, self.num_class))
-
-        dist = distmat * mask.float()
-        dist = dist / self.centers.var(dim=0).sum()
-
-        loss = dist.clamp(min=1e-12, max=1e+12).sum() / batch_size
-
-        return loss
-
-class PartitionLoss(nn.Module):
-    def __init__(self, ):
-        super(PartitionLoss, self).__init__()
-    
-    def forward(self, x):
-        num_head = x.size(1)
-
-        if num_head > 1:
-            var = x.var(dim=1).mean()
-            ## add eps to avoid empty var case
-            loss = torch.log(1+num_head/(var+eps))
-        else:
-            loss = 0
-            
-        return loss
-
 
 class ImbalancedDatasetSampler(data.sampler.Sampler):
     def __init__(self, dataset, indices: list = None, num_samples: int = None):
@@ -148,8 +103,6 @@ class ImbalancedDatasetSampler(data.sampler.Sampler):
         weights = 1.0 / label_to_count[df["label"]]
 
         self.weights = torch.DoubleTensor(weights.to_list())
-
-        # self.weights = self.weights.clamp(min=1e-5)
 
     def _get_labels(self, dataset):
         if isinstance(dataset, datasets.ImageFolder):
@@ -179,26 +132,27 @@ def run_training():
     model = DAN(num_class=args.num_class, num_head=args.num_head)
     model.to(device)
 
-        
     data_transforms = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.RandomHorizontalFlip(),
         transforms.RandomApply([
                 transforms.RandomAffine(20, scale=(0.8, 1), translate=(0.2, 0.2)),
             ], p=0.7),
-
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                  std=[0.229, 0.224, 0.225]),
-        transforms.RandomErasing(),
+        transforms.RandomErasing(p=0.1),
         ])
     
-    # train_dataset = AffectNet(args.aff_path, phase = 'train', transform = data_transforms)   # loading dynamically
-
-    train_dataset = datasets.ImageFolder(f'{args.aff_path}/train', transform = data_transforms)   # loading statically
-    if args.num_class == 7:   # ignore the 8-th class
-        idx = [i for i in range(len(train_dataset)) if train_dataset.imgs[i][1] != 7]
-        train_dataset = data.Subset(train_dataset, idx)
+    # Try loading from ImageFolder structure first
+    try:
+        train_dataset = datasets.ImageFolder(f'{args.aff_path}/train', transform = data_transforms)
+        if args.num_class == 7:
+            idx = [i for i in range(len(train_dataset)) if train_dataset.imgs[i][1] != 7]
+            train_dataset = data.Subset(train_dataset, idx)
+    except Exception as e:
+        print(f"Could not load from ImageFolder: {e}. Trying custom dataset.")
+        train_dataset = AffectNet(args.aff_path, phase = 'train', transform = data_transforms)
 
     print('Whole train set size:', train_dataset.__len__())
     train_loader = torch.utils.data.DataLoader(train_dataset,
@@ -214,12 +168,13 @@ def run_training():
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                  std=[0.229, 0.224, 0.225])])      
                                                                       
-    # val_dataset = AffectNet(args.aff_path, phase = 'val', transform = data_transforms_val)  # loading dynamically
-
-    val_dataset = datasets.ImageFolder(f'{args.aff_path}/val', transform = data_transforms_val)    # loading statically
-    if args.num_class == 7:   # ignore the 8-th class 
-        idx = [i for i in range(len(val_dataset)) if val_dataset.imgs[i][1] != 7]
-        val_dataset = data.Subset(val_dataset, idx)
+    try:
+        val_dataset = datasets.ImageFolder(f'{args.aff_path}/val', transform = data_transforms_val)
+        if args.num_class == 7:
+            idx = [i for i in range(len(val_dataset)) if val_dataset.imgs[i][1] != 7]
+            val_dataset = data.Subset(val_dataset, idx)
+    except:
+        val_dataset = AffectNet(args.aff_path, phase = 'val', transform = data_transforms_val)
 
     print('Validation set size:', val_dataset.__len__())
     
@@ -231,11 +186,24 @@ def run_training():
 
 
     criterion_cls = torch.nn.CrossEntropyLoss().to(device)
-    criterion_af = AffinityLoss(device, num_class=args.num_class)
+    criterion_center = CenterLoss(num_classes=args.num_class, feat_dim=512, use_gpu=torch.cuda.is_available())
     criterion_pt = PartitionLoss()
 
-    params = list(model.parameters()) + list(criterion_af.parameters())
-    optimizer = torch.optim.Adam(params,args.lr,weight_decay = 0)
+    # Split parameters for different learning rates
+    backbone_params = []
+    head_params = []
+    for name, param in model.named_parameters():
+        if 'features' in name or 'backbone' in name:
+            backbone_params.append(param)
+        else:
+            head_params.append(param)
+
+    optimizer = torch.optim.AdamW([
+        {'params': backbone_params, 'lr': args.lr_backbone},
+        {'params': head_params, 'lr': args.lr_head},
+        {'params': criterion_center.parameters(), 'lr': args.lr_center}
+    ], weight_decay=0.05)
+    
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma = 0.6)
 
     
@@ -253,11 +221,20 @@ def run_training():
             imgs = imgs.to(device)
             targets = targets.to(device)
             
-            out,feat,heads = model(imgs)
+            out, feat, heads = model(imgs)
 
-            loss = criterion_cls(out,targets) + criterion_af(feat,targets) + criterion_pt(heads)
+            loss_cls = criterion_cls(out, targets)
+            loss_pt = criterion_pt(heads)
+            loss_center = criterion_center(feat, targets)
+            
+            # L_total = L_cls + 0.1 * L_pt + 0.003 * L_center
+            loss = loss_cls + 0.1 * loss_pt + 0.003 * loss_center
 
             loss.backward()
+            
+            # Gradient clipping might be useful for Center Loss stability
+            # torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            
             optimizer.step()
             
             running_loss += loss
@@ -267,7 +244,7 @@ def run_training():
 
         acc = correct_sum.float() / float(train_dataset.__len__())
         running_loss = running_loss/iter_cnt
-        tqdm.write('[Epoch %d] Training accuracy: %.4f. Loss: %.3f. LR %.6f' % (epoch, acc, running_loss,optimizer.param_groups[0]['lr']))
+        tqdm.write('[Epoch %d] Training accuracy: %.4f. Loss: %.3f. LR: %s' % (epoch, acc, running_loss, str([g['lr'] for g in optimizer.param_groups])))
         
         with torch.no_grad():
             running_loss = 0.0
@@ -279,9 +256,13 @@ def run_training():
         
                 imgs = imgs.to(device)
                 targets = targets.to(device)
-                out,feat,heads = model(imgs)
+                out, feat, heads = model(imgs)
 
-                loss = criterion_cls(out,targets) + criterion_af(feat,targets) + criterion_pt(heads)
+                loss_cls = criterion_cls(out, targets)
+                loss_pt = criterion_pt(heads)
+                loss_center = criterion_center(feat, targets)
+                
+                loss = loss_cls + 0.1 * loss_pt + 0.003 * loss_center
 
                 running_loss += loss
                 iter_cnt+=1
@@ -298,6 +279,9 @@ def run_training():
             best_acc = max(acc,best_acc)
             tqdm.write("[Epoch %d] Validation accuracy:%.4f. Loss:%.3f" % (epoch, acc, running_loss))
             tqdm.write("best_acc:" + str(best_acc))
+
+            if not os.path.exists('checkpoints'):
+                os.makedirs('checkpoints')
 
             if args.num_class == 7 and  acc > 0.65:
                 torch.save({'iter': epoch,
