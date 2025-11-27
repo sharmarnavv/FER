@@ -146,7 +146,7 @@ def run_training():
     
     # Try loading from ImageFolder structure first
     try:
-        train_dataset = datasets.ImageFolder(f'{args.aff_path}/train', transform = data_transforms)
+        train_dataset = datasets.ImageFolder(f'{args.aff_path}/archive (3)/train', transform = data_transforms)
         if args.num_class == 7:
             idx = [i for i in range(len(train_dataset)) if train_dataset.imgs[i][1] != 7]
             train_dataset = data.Subset(train_dataset, idx)
@@ -169,7 +169,7 @@ def run_training():
                                  std=[0.229, 0.224, 0.225])])      
                                                                       
     try:
-        val_dataset = datasets.ImageFolder(f'{args.aff_path}/val', transform = data_transforms_val)
+        val_dataset = datasets.ImageFolder(f'{args.aff_path}/archive (3)/val', transform = data_transforms_val)
         if args.num_class == 7:
             idx = [i for i in range(len(val_dataset)) if val_dataset.imgs[i][1] != 7]
             val_dataset = data.Subset(val_dataset, idx)
