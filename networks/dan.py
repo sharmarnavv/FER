@@ -5,27 +5,35 @@ from torchvision import models
 import torch.nn.init as init
 
 class DAN(nn.Module):
-    def __init__(self, num_class=7, num_head=4, pretrained=True):
+    def __init__(self, num_class=7, num_head=4, pretrained=True, backbone='convnext_tiny'):
         super(DAN, self).__init__()
         
-        # Load ConvNeXt Tiny
-        # weights='DEFAULT' loads the best available weights (ImageNet)
-        weights = 'DEFAULT' if pretrained else None
-        try:
-            self.backbone = models.convnext_tiny(weights=weights)
-        except:
-            print("Warning: Could not load convnext_tiny from torchvision.models. Using resnet18 as fallback to prevent crash, but this is NOT the requested architecture.")
+        self.backbone_name = backbone
+        
+        if backbone == 'resnet18':
             self.backbone = models.resnet18(pretrained=pretrained)
             self.features = nn.Sequential(*list(self.backbone.children())[:-2])
             self.in_channels = 512
+        elif backbone == 'convnext_tiny':
+            # weights='DEFAULT' loads the best available weights (ImageNet)
+            weights = 'DEFAULT' if pretrained else None
+            try:
+                self.backbone = models.convnext_tiny(weights=weights)
+            except:
+                print("Warning: Could not load convnext_tiny from torchvision.models. Using resnet18 as fallback.")
+                self.backbone = models.resnet18(pretrained=pretrained)
+                self.features = nn.Sequential(*list(self.backbone.children())[:-2])
+                self.in_channels = 512
+            else:
+                # ConvNeXt Tiny structure:
+                # features: Sequential(...)
+                # classifier: Sequential(LayerNorm2d, Flatten, Linear)
+                # We only want the features. 
+                # Output of features is (B, 768, 7, 7) for 224x224 input.
+                self.features = self.backbone.features
+                self.in_channels = 768 
         else:
-            # ConvNeXt Tiny structure:
-            # features: Sequential(...)
-            # classifier: Sequential(LayerNorm2d, Flatten, Linear)
-            # We only want the features. 
-            # Output of features is (B, 768, 7, 7) for 224x224 input.
-            self.features = self.backbone.features
-            self.in_channels = 768 
+            raise ValueError(f"Backbone {backbone} not supported.") 
         
         self.num_head = num_head
         
